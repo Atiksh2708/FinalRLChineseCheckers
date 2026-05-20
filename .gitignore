@@ -1,0 +1,7 @@
+__pycache__/
+
+games/
+venv/
+checkpoints/
+checkpoints_axis2/
+checkpoints_axis3/
