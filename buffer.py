@@ -9,6 +9,8 @@ ppo.py can apply value-loss clipping (a stability trick that prevents
 the critic from making big jumps in any single mini-batch).
 """
 
+# buffer.py
+
 from __future__ import annotations
 
 import numpy as np
@@ -17,124 +19,265 @@ import torch
 
 class RolloutBuffer:
     """
-    Args:
-        rollout_len : number of timesteps per rollout (T)
-        obs_dim     : flat state vector length
-        action_dim  : flat action space size
-        gamma       : discount factor
-        gae_lambda  : GAE smoothing parameter (λ)
-        device      : torch device for batch tensors
+    PPO rollout buffer for vectorized environments.
+
+    Stores:
+        T timesteps
+        N parallel environments
+
+    Shape convention:
+        (T, N, ...)
     """
 
-    def __init__(self, rollout_len: int, obs_dim: int, action_dim: int,
-                 gamma: float = 0.99, gae_lambda: float = 0.95,
+    def __init__(self,
+                 num_envs: int,
+                 rollout_len: int,
+                 obs_dim: int,
+                 action_dim: int,
+                 gamma: float = 0.99,
+                 gae_lambda: float = 0.95,
                  device: torch.device = torch.device("cpu")):
 
+        self.num_envs = num_envs
         self.rollout_len = rollout_len
-        self.obs_dim     = obs_dim
-        self.action_dim  = action_dim
-        self.gamma       = gamma
-        self.gae_lambda  = gae_lambda
-        self.device      = device
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
 
-        self._reset_storage()
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
 
-    def _reset_storage(self):
-        T, D, A = self.rollout_len, self.obs_dim, self.action_dim
+        self.device = device
 
-        self.obs          = np.zeros((T, D), dtype=np.float32)
-        self.actions      = np.zeros(T,      dtype=np.int64)
-        self.log_probs    = np.zeros(T,      dtype=np.float32)
-        self.rewards      = np.zeros(T,      dtype=np.float32)
-        self.values       = np.zeros(T,      dtype=np.float32)
-        self.dones        = np.zeros(T,      dtype=np.float32)
-        self.action_masks = np.zeros((T, A), dtype=np.float32)
+        self.reset()
 
-        self.advantages   = np.zeros(T, dtype=np.float32)
-        self.returns      = np.zeros(T, dtype=np.float32)
+    def reset(self):
+
+        T = self.rollout_len
+        N = self.num_envs
+
+        self.obs = np.zeros(
+            (T, N, self.obs_dim),
+            dtype=np.float32,
+        )
+
+        self.actions = np.zeros(
+            (T, N),
+            dtype=np.int64,
+        )
+
+        self.log_probs = np.zeros(
+            (T, N),
+            dtype=np.float32,
+        )
+
+        self.rewards = np.zeros(
+            (T, N),
+            dtype=np.float32,
+        )
+
+        self.values = np.zeros(
+            (T, N),
+            dtype=np.float32,
+        )
+
+        self.dones = np.zeros(
+            (T, N),
+            dtype=np.float32,
+        )
+
+        self.action_masks = np.zeros(
+            (T, N, self.action_dim),
+            dtype=np.float32,
+        )
+
+        self.advantages = np.zeros(
+            (T, N),
+            dtype=np.float32,
+        )
+
+        self.returns = np.zeros(
+            (T, N),
+            dtype=np.float32,
+        )
 
         self.ptr = 0
 
-    def add(self, obs, action, log_prob, reward, value, done, action_mask):
-        """Store one transition."""
-        assert self.ptr < self.rollout_len, \
-            "Buffer is full — call compute_gae() then reset()"
+    def add(self,
+            obs,
+            action,
+            log_prob,
+            reward,
+            value,
+            done,
+            action_mask):
 
-        def to_np(x):
-            if isinstance(x, torch.Tensor):
-                return x.detach().cpu().numpy()
-            return np.asarray(x)
+        assert self.ptr < self.rollout_len, (
+            "RolloutBuffer overflow."
+        )
 
-        i = self.ptr
-        self.obs[i]          = to_np(obs)
-        self.actions[i]      = int(action)
-        self.log_probs[i]    = float(to_np(log_prob))
-        self.rewards[i]      = float(reward)
-        self.values[i]       = float(to_np(value))
-        self.dones[i]        = float(done)
-        self.action_masks[i] = to_np(action_mask)
+        t = self.ptr
+
+        self.obs[t] = obs
+        self.actions[t] = action
+        self.log_probs[t] = log_prob
+        self.rewards[t] = reward
+        self.values[t] = value
+        self.dones[t] = done
+        self.action_masks[t] = action_mask
 
         self.ptr += 1
 
-    def compute_gae(self, last_value: float):
+    def compute_gae(self, last_values):
+
         """
-        Compute GAE advantages and discounted returns.
-        Must be called after the rollout is complete (ptr == rollout_len).
+        last_values:
+            shape (N,)
         """
-        assert self.ptr == self.rollout_len, \
-            f"Buffer not full ({self.ptr}/{self.rollout_len})"
 
-        gae = 0.0
-        for t in reversed(range(self.rollout_len)):
-            next_non_terminal = 1.0 - self.dones[t]
-            next_value        = (last_value if t == self.rollout_len - 1
-                                 else self.values[t + 1])
+        T = self.rollout_len
+        N = self.num_envs
 
-            delta = (self.rewards[t]
-                     + self.gamma * next_value * next_non_terminal
-                     - self.values[t])
+        gae = np.zeros(N, dtype=np.float32)
 
-            gae = delta + self.gamma * self.gae_lambda \
-                        * next_non_terminal * gae
+        for t in reversed(range(T)):
+
+            if t == T - 1:
+                next_values = last_values
+            else:
+                next_values = self.values[t + 1]
+
+            nonterminal = 1.0 - self.dones[t]
+
+            delta = (
+                self.rewards[t]
+                + self.gamma
+                * next_values
+                * nonterminal
+                - self.values[t]
+            )
+
+            gae = (
+                delta
+                + self.gamma
+                * self.gae_lambda
+                * nonterminal
+                * gae
+            )
+
             self.advantages[t] = gae
 
-        self.returns = self.advantages + self.values
+        self.returns = (
+            self.advantages
+            + self.values
+        )
 
-        # Normalize advantages — zero mean, unit variance
-        adv = self.advantages
-        if adv.std() > 1e-8:
-            self.advantages = (adv - adv.mean()) / (adv.std() + 1e-8)
-        else:
-            self.advantages = adv - adv.mean()
+        # Normalize advantages globally
+        flat_adv = self.advantages.reshape(-1)
 
-    def get_batches(self, batch_size: int):
+        adv_mean = flat_adv.mean()
+        adv_std = flat_adv.std()
+
+        self.advantages = (
+            self.advantages - adv_mean
+        ) / (adv_std + 1e-8)
+
+    def get_batches(self, batch_size):
+
         """
-        Yield random mini-batches as torch tensors on self.device.
-
-        Yields tuples of (obs, actions, old_log_probs, advantages, returns,
-                          action_masks, old_values).
+        Flatten:
+            (T, N, ...) → (T*N, ...)
         """
-        T       = self.rollout_len
-        indices = np.random.permutation(T)
 
-        # Convert entire buffer to tensors once — cheaper than per-batch
-        obs_t  = torch.tensor(self.obs,         device=self.device)
-        act_t  = torch.tensor(self.actions,      device=self.device)
-        lp_t   = torch.tensor(self.log_probs,    device=self.device)
-        adv_t  = torch.tensor(self.advantages,   device=self.device)
-        ret_t  = torch.tensor(self.returns,      device=self.device)
-        mask_t = torch.tensor(self.action_masks, device=self.device)
-        val_t  = torch.tensor(self.values,       device=self.device)
+        total = (
+            self.rollout_len
+            * self.num_envs
+        )
 
-        for start in range(0, T, batch_size):
-            idx = indices[start: start + batch_size]
-            yield (obs_t[idx], act_t[idx], lp_t[idx],
-                   adv_t[idx], ret_t[idx], mask_t[idx], val_t[idx])
+        obs = self.obs.reshape(
+            total,
+            self.obs_dim,
+        )
 
-    def reset(self):
-        """Clear buffer for next rollout."""
-        self._reset_storage()
+        actions = self.actions.reshape(total)
+
+        log_probs = self.log_probs.reshape(total)
+
+        advantages = self.advantages.reshape(total)
+
+        returns = self.returns.reshape(total)
+
+        masks = self.action_masks.reshape(
+            total,
+            self.action_dim,
+        )
+
+        values = self.values.reshape(total)
+
+        indices = np.random.permutation(total)
+
+        obs_t = torch.tensor(
+            obs,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        actions_t = torch.tensor(
+            actions,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        log_probs_t = torch.tensor(
+            log_probs,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        advantages_t = torch.tensor(
+            advantages,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        returns_t = torch.tensor(
+            returns,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        masks_t = torch.tensor(
+            masks,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        values_t = torch.tensor(
+            values,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        for start in range(0, total, batch_size):
+
+            idx = indices[
+                start:start + batch_size
+            ]
+
+            yield (
+                obs_t[idx],
+                actions_t[idx],
+                log_probs_t[idx],
+                advantages_t[idx],
+                returns_t[idx],
+                masks_t[idx],
+                values_t[idx],
+            )
 
     @property
-    def is_full(self) -> bool:
-        return self.ptr == self.rollout_len
+    def is_full(self):
+
+        return (
+            self.ptr
+            >= self.rollout_len
+        )
+

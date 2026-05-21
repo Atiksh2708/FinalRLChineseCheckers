@@ -11,6 +11,8 @@ learner exposure to a wider distribution of board states than self-play
 alone would produce.
 """
 
+# opponents.py
+
 from __future__ import annotations
 
 import numpy as np
@@ -136,8 +138,37 @@ class ModelOpponent:
         self.name  = "current" if label == "current" else "frozen"
 
     def select_action(self, env, state, mask, device):
-        obs_t  = torch.tensor(state, dtype=torch.float32, device=device)
-        mask_t = torch.tensor(mask,  dtype=torch.float32, device=device)
+
+        # Always use model device
+        model_device = next(
+            self.model.parameters()
+        ).device
+
+        # --------------------------------------------------------
+        # Add batch dimension
+        # --------------------------------------------------------
+
+        obs_t = torch.tensor(
+            state,
+            dtype=torch.float32,
+            device=model_device,
+        ).unsqueeze(0)
+
+        mask_t = torch.tensor(
+            mask,
+            dtype=torch.float32,
+            device=model_device,
+        ).unsqueeze(0)
+
         with torch.no_grad():
-            action_id, _, _, _ = self.model.act(obs_t, mask_t)
-        return action_id
+
+            actions, _, _, _ = self.model.act(
+                obs_t,
+                mask_t,
+            )
+
+        # --------------------------------------------------------
+        # Convert tensor -> python int
+        # --------------------------------------------------------
+
+        return int(actions.squeeze(0).item())

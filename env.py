@@ -38,6 +38,8 @@ KEY DESIGN DECISIONS
    intra-destination rewards caused training collapse.)
 """
 
+# env.py
+
 from __future__ import annotations
 
 import builtins
@@ -158,10 +160,14 @@ class ChineseCheckersEnv:
         self._target_cache = {}
         self._goal_depths = {}         # color → {cell_idx: depth} normalized 0..N
         self._pin_start_dists = {}
+        self.valid_move_cache = {}
 
     # ── reset ────────────────────────────────────────────────────────────────
     def reset(self, pins_advanced: int = 0):
         """Set up a new game with optional curriculum head-start."""
+        
+        # print("AXIS:", self.assigned)
+
         assert 0 <= pins_advanced <= NUM_PINS_PER_PLAYER, \
             f"pins_advanced must be in [0, {NUM_PINS_PER_PLAYER}]"
 
@@ -289,7 +295,7 @@ class ChineseCheckersEnv:
 
     # ── step ─────────────────────────────────────────────────────────────────
     def step(self, action_id: int):
-        """Apply an action."""
+        """Apply an action. Ends episode if any player wins or step limit reached."""
         assert not self.done, "Episode is over. Call reset() first."
 
         color = self.current_color
@@ -301,6 +307,22 @@ class ChineseCheckersEnv:
             return self._get_state(), 0.0, self.done
 
         legal = pin.getPossibleMoves()
+        
+        # --------------------------------------------------------
+        # No legal moves
+        # --------------------------------------------------------
+
+        if len(legal) == 0:
+
+            self._advance_turn()
+
+            return (
+                self._get_state(),
+                -1.0,
+                self.done,
+            )
+        
+
         if dest_idx not in legal:
             self._advance_turn()
             return self._get_state(), 0.0, self.done
@@ -309,6 +331,7 @@ class ChineseCheckersEnv:
 
         with _SilencePrint():
             success = pin.placePin(dest_idx)
+            self.valid_move_cache.clear()
         if not success:
             self._advance_turn()
             return self._get_state(), 0.0, self.done
@@ -316,11 +339,23 @@ class ChineseCheckersEnv:
         self._step_count += 1
         next_info = self._compute_state_info(color)
 
+        # Check if current player won
         won = self._check_win(color)
         if won:
             self.done = True
+            reward = self._compute_reward(color, prev_info, next_info, won=True)
+            return self._get_state(), reward, self.done
 
-        reward = self._compute_reward(color, prev_info, next_info, won=won)
+        # Check if any opponent won (agent loses)
+        for opp_color in self.assigned:
+            if opp_color != color and self._check_win(opp_color):
+                self.done = True
+                # Assign strong negative reward for losing
+                reward = -200.0
+                return self._get_state(), reward, self.done
+
+        # Normal reward
+        reward = self._compute_reward(color, prev_info, next_info, won=False)
 
         if self._step_count >= MAX_STEPS:
             self.done = True
@@ -329,38 +364,78 @@ class ChineseCheckersEnv:
         return self._get_state(), reward, self.done
 
     # ── action mask ──────────────────────────────────────────────────────────
-    def build_action_mask(self, color: Optional[str] = None) -> np.ndarray:
-        """
-        Binary float32 mask of shape (action_dim,). 1=valid, 0=invalid.
+    _mask_warn_counts = {}
 
-        HARD PIN LOCK: pins inside their destination are completely excluded
-        from the agent's action space. Goal-zone rearrangement (moving pins
-        deeper) is handled by find_rearrangement_move() — a rule that runs
-        before the agent acts and consumes the player's turn when applicable.
+        
+    def build_action_mask(self,
+                        color: Optional[str] = None) -> np.ndarray:
         """
+        Binary float32 mask of shape (action_dim,).
+
+        1 = valid
+        0 = invalid
+        """
+
         if color is None:
             color = self.current_color
+
         target = self._target_cache[color]
-        mask = np.zeros(self.action_dim, dtype=np.float32)
+
+        mask = np.zeros(
+            self.action_dim,
+            dtype=np.float32,
+        )
+
         for pin, dest in self.get_valid_moves(color):
+
+            # ----------------------------------------------------
+            # Hard lock goal pins
+            # ----------------------------------------------------
+
             if pin.axialindex in target:
-                continue   # goal pin — hard locked
-            aid = encode_action(pin.id, dest, self.num_cells)
+                continue
+
+            aid = encode_action(
+                pin.id,
+                dest,
+                self.num_cells,
+            )
+
             if 0 <= aid < self.action_dim:
                 mask[aid] = 1.0
+
         return mask
 
-    def get_valid_moves(self, color: Optional[str] = None) -> List:
-        """
-        List of (Pin, dest_axial_index) for every legal move.
-        Returns ALL physically legal moves (no goal-pin filter).
-        """
+    def get_valid_moves(self,
+                        color: Optional[str] = None) -> List:
+
         if color is None:
             color = self.current_color
-        return [
-            (p, d) for p in self.pins if p.color == color
+
+        cache_key = (
+            color,
+            tuple(
+                sorted(
+                    (p.color, p.axialindex)
+                    for p in self.pins
+                )
+            )
+        )
+
+        if cache_key in self.valid_move_cache:
+            return self.valid_move_cache[cache_key]
+
+        moves = [
+            (p, d)
+            for p in self.pins
+            if p.color == color
             for d in p.getPossibleMoves()
         ]
+
+        self.valid_move_cache[cache_key] = moves
+
+        return moves
+
 
     # ── rule-based rearrangement ────────────────────────────────────────────
     def find_rearrangement_move(self, color: Optional[str] = None):
@@ -581,116 +656,124 @@ class ChineseCheckersEnv:
           [171 : 181]  pin_start_dists  each pin's STARTING distance / 16
           [181 : 186]  scalars          5 global summary statistics
         """
-        color  = self.current_color
-        target = self._target_cache[color]
-        target_list = sorted(target)
+        try:
+            color  = self.current_color
+            target = self._target_cache[color]
+            target_list = sorted(target)
 
-        my_pins  = sorted([p for p in self.pins if p.color == color],
-                          key=lambda p: p.id)
-        opp_pins = [p for p in self.pins if p.color != color]
+            my_pins  = sorted([p for p in self.pins if p.color == color],
+                              key=lambda p: p.id)
+            opp_pins = [p for p in self.pins if p.color != color]
 
-        # 1. Occupancy
-        occupancy = np.zeros(self.num_cells, dtype=np.float32)
-        for p in my_pins:
-            occupancy[p.axialindex] = 1.0
-        for p in opp_pins:
-            occupancy[p.axialindex] = -1.0
+            # 1. Occupancy
+            occupancy = np.zeros(self.num_cells, dtype=np.float32)
+            for p in my_pins:
+                occupancy[p.axialindex] = 1.0
+            for p in opp_pins:
+                occupancy[p.axialindex] = -1.0
 
-        # 2. My pin distances to nearest target
-        my_dists = np.array([
-            min(self._bfs_dist(p.axialindex, t) for t in target) / MAX_HEX_DIST
-            for p in my_pins
-        ], dtype=np.float32)
-
-        # 3. My pin distances to nearest EMPTY target
-        empty_targets = [t for t in target if not self.board.cells[t].occupied]
-        if empty_targets:
-            my_dists_empty = np.array([
-                min(self._bfs_dist(p.axialindex, t) for t in empty_targets) / MAX_HEX_DIST
+            # 2. My pin distances to nearest target
+            my_dists = np.array([
+                min(self._bfs_dist(p.axialindex, t) for t in target) / MAX_HEX_DIST
                 for p in my_pins
             ], dtype=np.float32)
-        else:
-            my_dists_empty = np.zeros(NUM_PINS_PER_PLAYER, dtype=np.float32)
 
-        # 4. Am I home (per pin)
-        am_i_home = np.array([
-            1.0 if p.axialindex in target else 0.0
-            for p in my_pins
-        ], dtype=np.float32)
+            # 3. My pin distances to nearest EMPTY target
+            empty_targets = [t for t in target if not self.board.cells[t].occupied]
+            if empty_targets:
+                my_dists_empty = np.array([
+                    min(self._bfs_dist(p.axialindex, t) for t in empty_targets) / MAX_HEX_DIST
+                    for p in my_pins
+                ], dtype=np.float32)
+            else:
+                my_dists_empty = np.zeros(NUM_PINS_PER_PLAYER, dtype=np.float32)
 
-        # 5. Path blockers
-        my_path_blockers = np.ones(NUM_PINS_PER_PLAYER, dtype=np.float32)
-        for i, p in enumerate(my_pins):
-            best = MAX_HEX_DIST
-            d_pin_target_min = min(
-                self._bfs_dist(p.axialindex, t) for t in target
-            )
-            for e in opp_pins:
-                d_pin_enemy = self._bfs_dist(p.axialindex, e.axialindex)
-                d_enemy_target_min = min(
-                    self._bfs_dist(e.axialindex, t) for t in target
+            # 4. Am I home (per pin)
+            am_i_home = np.array([
+                1.0 if p.axialindex in target else 0.0
+                for p in my_pins
+            ], dtype=np.float32)
+
+            # 5. Path blockers
+            my_path_blockers = np.ones(NUM_PINS_PER_PLAYER, dtype=np.float32)
+            for i, p in enumerate(my_pins):
+                best = MAX_HEX_DIST
+                d_pin_target_min = min(
+                    self._bfs_dist(p.axialindex, t) for t in target
                 )
-                if d_pin_enemy + d_enemy_target_min <= d_pin_target_min + 2:
-                    best = min(best, d_pin_enemy)
-            my_path_blockers[i] = best / MAX_HEX_DIST
+                for e in opp_pins:
+                    d_pin_enemy = self._bfs_dist(p.axialindex, e.axialindex)
+                    d_enemy_target_min = min(
+                        self._bfs_dist(e.axialindex, t) for t in target
+                    )
+                    if d_pin_enemy + d_enemy_target_min <= d_pin_target_min + 2:
+                        best = min(best, d_pin_enemy)
+                my_path_blockers[i] = best / MAX_HEX_DIST
 
-        # 6. Target occupancy
-        my_pin_indices = {p.axialindex for p in my_pins}
-        target_occupancy = np.array([
-            1.0 if t in my_pin_indices else 0.0
-            for t in target_list
-        ], dtype=np.float32)
+            # 6. Target occupancy
+            my_pin_indices = {p.axialindex for p in my_pins}
+            target_occupancy = np.array([
+                1.0 if t in my_pin_indices else 0.0
+                for t in target_list
+            ], dtype=np.float32)
 
-        # 7. Per-pin starting distances
-        start_dists_normalized = np.array([
-            d / MAX_HEX_DIST
-            for d in self._pin_start_dists[color]
-        ], dtype=np.float32)
+            # 7. Per-pin starting distances
+            start_dists_normalized = np.array([
+                d / MAX_HEX_DIST
+                for d in self._pin_start_dists[color]
+            ], dtype=np.float32)
 
-        # 8. Global scalars
-        my_pins_home_frac = float(am_i_home.sum() / NUM_PINS_PER_PLAYER)
+            # 8. Global scalars
+            my_pins_home_frac = float(am_i_home.sum() / NUM_PINS_PER_PLAYER)
 
-        opp_pins_home_fracs = []
-        opp_mean_dists      = []
-        active_opponents    = 0
-        for opp_color in self.assigned:
-            if opp_color == color:
-                continue
-            opp_target = self._target_cache[opp_color]
-            opp_color_pins = [p for p in self.pins if p.color == opp_color]
-            if not opp_color_pins:
-                continue
-            home = sum(1 for p in opp_color_pins if p.axialindex in opp_target)
-            opp_pins_home_fracs.append(home / NUM_PINS_PER_PLAYER)
-            mean_d = sum(
-                min(self._bfs_dist(p.axialindex, t) for t in opp_target)
-                for p in opp_color_pins
-            ) / (len(opp_color_pins) * MAX_HEX_DIST)
-            opp_mean_dists.append(mean_d)
-            active_opponents += 1
+            opp_pins_home_fracs = []
+            opp_mean_dists      = []
+            active_opponents    = 0
+            for opp_color in self.assigned:
+                if opp_color == color:
+                    continue
+                opp_target = self._target_cache[opp_color]
+                opp_color_pins = [p for p in self.pins if p.color == opp_color]
+                if not opp_color_pins:
+                    continue
+                home = sum(1 for p in opp_color_pins if p.axialindex in opp_target)
+                opp_pins_home_fracs.append(home / NUM_PINS_PER_PLAYER)
+                mean_d = sum(
+                    min(self._bfs_dist(p.axialindex, t) for t in opp_target)
+                    for p in opp_color_pins
+                ) / (len(opp_color_pins) * MAX_HEX_DIST)
+                opp_mean_dists.append(mean_d)
+                active_opponents += 1
 
-        max_opp_home_frac = max(opp_pins_home_fracs) if opp_pins_home_fracs else 0.0
-        min_opp_mean_dist = min(opp_mean_dists)      if opp_mean_dists      else 1.0
-        active_opp_frac   = active_opponents / max(1, len(self.assigned) - 1)
+            max_opp_home_frac = max(opp_pins_home_fracs) if opp_pins_home_fracs else 0.0
+            min_opp_mean_dist = min(opp_mean_dists)      if opp_mean_dists      else 1.0
+            active_opp_frac   = active_opponents / max(1, len(self.assigned) - 1)
 
-        scalars = np.array([
-            my_pins_home_frac,
-            max_opp_home_frac,
-            float(np.mean(my_dists)),
-            min_opp_mean_dist,
-            active_opp_frac,
-        ], dtype=np.float32)
+            scalars = np.array([
+                my_pins_home_frac,
+                max_opp_home_frac,
+                float(np.mean(my_dists)),
+                min_opp_mean_dist,
+                active_opp_frac,
+            ], dtype=np.float32)
 
-        return np.concatenate([
-            occupancy,
-            my_dists,
-            my_dists_empty,
-            am_i_home,
-            my_path_blockers,
-            target_occupancy,
-            start_dists_normalized,
-            scalars,
-        ])
+            state = np.concatenate([
+                occupancy,
+                my_dists,
+                my_dists_empty,
+                am_i_home,
+                my_path_blockers,
+                target_occupancy,
+                start_dists_normalized,
+                scalars,
+            ])
+            if np.any(np.isnan(state)) or np.any(np.isinf(state)):
+                print("[WARN] _get_state: NaN or Inf detected in state vector, returning zeros.")
+                return np.zeros(186, dtype=np.float32)
+            return state
+        except Exception as e:
+            print(f"[ERROR] _get_state failed: {e}; returning zeros.")
+            return np.zeros(186, dtype=np.float32)
 
     # ── win check ────────────────────────────────────────────────────────────
     def _check_win(self, color: str) -> bool:

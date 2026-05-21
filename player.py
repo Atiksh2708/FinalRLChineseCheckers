@@ -38,12 +38,12 @@ DEBUG_NET = os.getenv("DEBUG_NET", "0") not in ("0", "", "false", "False")
 #     'purple'    : "checkpoints_axis3/model_best.pt",
 # }
 COLOR_TO_CHECKPOINT = {
-    'red'       : "final_models/axis1/model_iter1000.pt",
-    'blue'      : "final_models/axis1/model_iter1000.pt",
-    'lawn green': "final_models/axis2/model_iter1000.pt",
-    'gray0'     : "final_models/axis2/model_iter1000.pt",
-    'yellow'    : "final_models/axis3/model_best.pt",
-    'purple'    : "final_models/axis3/model_best.pt",
+    'red'       : "checkpoints_axis1/model_iter300.pt",
+    'blue'      : "checkpoints_axis1/model_iter300.pt",
+    'lawn green': "checkpoints_axis2/model_iter300.pt",
+    'gray0'     : "checkpoints_axis2/model_iter300.pt",
+    'yellow'    : "checkpoints_axis3/model_iter300.pt",
+    'purple'    : "checkpoints_axis3/model_iter300.pt",
 }
 
 # Fallback if a specific axis's checkpoint is missing (e.g. axis C never
@@ -112,11 +112,47 @@ class Agent:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[AGENT] device={self.device}")
 
-        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        obs_dim    = ckpt["obs_dim"]
-        action_dim = ckpt["action_dim"]
-        hidden_dim = ckpt.get("hidden_dim", 512)
-        n_blocks   = ckpt.get("n_blocks", 4)
+        # ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        # obs_dim    = ckpt["obs_dim"]
+        # action_dim = ckpt["action_dim"]
+        # hidden_dim = ckpt.get("hidden_dim", 512)
+        # n_blocks   = ckpt.get("n_blocks", 4)
+
+        ckpt = torch.load(
+            checkpoint_path,
+            map_location=self.device,
+            weights_only=False,
+        )
+
+        # --------------------------------------------------------
+        # Infer dimensions dynamically
+        # --------------------------------------------------------
+
+        dummy_env = ChineseCheckersEnv(
+            n_players=6
+        )
+
+        dummy_state = dummy_env.reset(
+            pins_advanced=0
+        )
+
+        obs_dim = len(dummy_state)
+
+        action_dim = dummy_env.action_dim
+
+        # --------------------------------------------------------
+        # Architecture
+        # --------------------------------------------------------
+
+        hidden_dim = ckpt.get(
+            "hidden_dim",
+            512,
+        )
+
+        n_blocks = ckpt.get(
+            "n_blocks",
+            4,
+        )
 
         self.model = ActorCritic(
             obs_dim=obs_dim, action_dim=action_dim,
@@ -210,9 +246,31 @@ class Agent:
             return None, None, None
 
         state  = env._get_state()
-        obs_t  = torch.tensor(state, dtype=torch.float32, device=self.device)
-        mask_t = torch.tensor(mask,  dtype=torch.float32, device=self.device)
-        action_id = self.model.act_greedy(obs_t, mask_t)
+        # obs_t  = torch.tensor(state, dtype=torch.float32, device=self.device)
+        # mask_t = torch.tensor(mask,  dtype=torch.float32, device=self.device)
+        # action_id = self.model.act_greedy(obs_t, mask_t)
+
+        obs_t = torch.tensor(
+            state,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+
+        mask_t = torch.tensor(
+            mask,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+
+        action_id = self.model.act_greedy(
+            obs_t,
+            mask_t,
+        )
+
+        action_id = int(
+            action_id.squeeze(0).item()
+        )
+
         pin_id, dest_idx = decode_action(action_id, env.num_cells)
         return int(pin_id), int(dest_idx), "AGENT"
 
