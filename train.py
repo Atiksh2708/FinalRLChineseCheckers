@@ -37,7 +37,7 @@ CFG = dict(
 
     n_players=2,
 
-    total_timesteps=5_000_000,
+    total_timesteps=15_000_000,
 
     num_envs=128,
 
@@ -93,12 +93,15 @@ CFG = dict(
 
     # color_pair=["red", "blue"],
     # checkpoint_dir="checkpoints_axis1",
+    # checkpoint_dir="final_models/axis1",
 
-    # color_pair=["yellow", "purple"],
+    # color_pair=["lawn green", "gray0"],
     # checkpoint_dir="checkpoints_axis2",
+    # checkpoint_dir="final_models/axis2",
 
-    color_pair=["lawn green", "gray0"],
+    color_pair=["yellow", "purple"],
     checkpoint_dir="checkpoints_axis3",
+    # checkpoint_dir="final_models/axis3",
 
 
     device="cuda",
