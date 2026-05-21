@@ -29,19 +29,28 @@ DEBUG_NET = os.getenv("DEBUG_NET", "0") not in ("0", "", "false", "False")
 # At deployment, the assigned color determines which model loads.
 #
 # Edit these paths to point at your final checkpoints.
+# COLOR_TO_CHECKPOINT = {
+#     'red'       : "checkpoints/model_iter1000.pt",
+#     'blue'      : "checkpoints/model_iter1000.pt",
+#     'lawn green': "checkpoints_axis2/model_iter1000.pt",
+#     'gray0'     : "checkpoints_axis2/model_iter1000.pt",
+#     'yellow'    : "checkpoints_axis3/model_best.pt",
+#     'purple'    : "checkpoints_axis3/model_best.pt",
+# }
 COLOR_TO_CHECKPOINT = {
-    'red'       : "checkpoints/model_iter1000.pt",
-    'blue'      : "checkpoints/model_iter1000.pt",
-    'lawn green': "checkpoints_axis2/model_iter1000.pt",
-    'gray0'     : "checkpoints_axis2/model_iter1000.pt",
-    'yellow'    : "checkpoints_axis3/model_best.pt",
-    'purple'    : "checkpoints_axis3/model_best.pt",
+    'red'       : "final_models/axis1/model_iter1000.pt",
+    'blue'      : "final_models/axis1/model_iter1000.pt",
+    'lawn green': "final_models/axis2/model_iter1000.pt",
+    'gray0'     : "final_models/axis2/model_iter1000.pt",
+    'yellow'    : "final_models/axis3/model_best.pt",
+    'purple'    : "final_models/axis3/model_best.pt",
 }
 
 # Fallback if a specific axis's checkpoint is missing (e.g. axis C never
 # finished training). At least the red↔blue model partly recognizes the
 # board; better than a crash.
-FALLBACK_CHECKPOINT = "checkpoints/model_iter1000.pt"
+# FALLBACK_CHECKPOINT = "checkpoints/model_iter1000.pt"
+FALLBACK_CHECKPOINT = "final_models/axis1/model_iter1000.pt"
 
 USE_RULE_REARRANGEMENT = True   # match training-time behavior
 
