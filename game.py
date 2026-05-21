@@ -51,7 +51,7 @@ random.shuffle(PRIMARY_COLOURS)
 COMPLEMENT = {'red': 'blue', 'lawn green': 'gray0', 'yellow': 'purple'}
 MAX_PLAYERS = 6
 TURN_TIMEOUT_SEC = 10
-GAME_TIME_LIMIT_SEC = 300
+GAME_TIME_LIMIT_SEC = 120
 
 
 # ==========================================================
@@ -213,7 +213,7 @@ class Game:
             # Move score — asymmetric Gaussian
             move_score_func = lambda x: math.exp(-((x - 45) ** 2) /
                                                  (2 * ((4 if x < 45 else 18) ** 2)))
-            move_score = move_score_func(pl.move_count) if pl.move_count > 0 else 0
+            move_score = 100 * move_score_func(pl.move_count) if pl.move_count > 0 else 0
 
             # Pins in goal
             pins_in_goal = sum(
@@ -231,9 +231,17 @@ class Game:
                     best = min(axial_dist(self.board.cells[p.axialindex], tgt)
                                for tgt in target_cells)
                     total_dist += best
-            distance_score = max(0.0, 200.0 - total_dist) if pl.move_count > 0 else 0
+            distance_score = max(0.0, 400.0 - 2 * total_dist) if pl.move_count > 0 else 0
 
             final_score = time_score + move_score + pin_goal_score + distance_score
+
+            # Win bonus — ensures a win ranks above any non-win regardless of
+            # the other score components (matches tournament scoring).
+            if pl.status == "WIN":
+                final_score += 1000.0
+                win_bonus = 1000.0
+            else:
+                win_bonus = 0.0
 
             self.scores[pl.player_id] = {
                 "final_score": final_score,
@@ -245,13 +253,14 @@ class Game:
                 "pins_in_goal": pins_in_goal,
                 "total_distance": total_dist,
                 "time_taken_sec": pl.time_taken_sec,
+                "win_bonus": win_bonus,
             }
 
             write_log(
                 self.game_id,
                 f"SCORE {pl.name} ({colour}): Final={final_score:.1f}, "
                 f"Time={time_score:.1f}, Moves({pl.move_count})={move_score:.1f}, "
-                f"Pins({pins_in_goal})={pin_goal_score:.1f}, Dist={distance_score:.1f}"
+                f"Pins({pins_in_goal})={pin_goal_score:.1f}, Dist={distance_score:.1f}, Win={win_bonus:.1f}"
             )
 
     # ----------------------------------
